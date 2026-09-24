@@ -170,6 +170,15 @@ endif()
 
 if(NOT EXECUTORCH_BUILD_ROCM AND CMAKE_CUDA_COMPILER)
   enable_language(CUDA)
+  # nvcc compiles host code with cl.exe on Windows, and the CCCL that ships with
+  # CUDA 13.2 and newer stops with an #error under cl.exe's traditional
+  # preprocessor. The standard one is what CCCL asks for, and older toolkits
+  # accept it too.
+  if(WIN32)
+    add_compile_options(
+      "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>"
+    )
+  endif()
 endif()
 
 # Centralize Windows/MSVC checks used throughout this file.
@@ -335,7 +344,21 @@ endif()
 # appends to any INSTALL_RPATH the caller set rather than replacing it, so a
 # source install keeps its own paths.
 if(EXECUTORCH_BUILD_SHARED)
+  if(_cuda_is_windows_msvc)
+    # In the shared layout the delegate is its own DLL and imports the stream
+    # guard functions (get/set/peek/clearCurrentCUDAStream) from this one. They
+    # carry no AOTI_SHIM_EXPORT, so the annotations alone would not export them;
+    # export everything, as every other shipped DLL does.
+    set_target_properties(
+      aoti_cuda_shims PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON
+    )
+  endif()
   executorch_target_shipped_runtime_path(aoti_cuda_shims)
+  if(_cuda_is_msvc_toolchain)
+    # extension_cuda is linked PRIVATE on MSVC and so brings no runtime; resolve
+    # it from the shared library rather than the static core cuda_platform uses.
+    executorch_target_link_shared_runtime(aoti_cuda_shims)
+  endif()
 endif()
 
 install(
@@ -353,11 +376,6 @@ set(_aoti_cuda_backend_sources
 if(EXECUTORCH_BUILD_EXTENSION_LLM)
   list(APPEND _aoti_cuda_backend_sources runtime/cuda_kv_cache.cpp)
 endif()
-if(_cuda_is_msvc_toolchain)
-  # MSVC links aoti_cuda_backend into portable_lib without relying on C++
-  # symbols exported from aoti_cuda_shims.dll.
-  list(APPEND _aoti_cuda_backend_sources runtime/cuda_allocator.cpp)
-endif()
 
 # Build the delegate as a shared library for the wheel so a process has one copy
 # of it, and keep it static everywhere else so no other build changes.
@@ -373,6 +391,14 @@ if(EXECUTORCH_BUILD_SHARED AND NOT EXECUTORCH_BUILD_ROCM)
 else()
   set(_executorch_cuda_ships_libraries OFF)
   set(_aoti_cuda_backend_library_type STATIC)
+endif()
+if(_cuda_is_msvc_toolchain AND NOT _executorch_cuda_ships_libraries)
+  # MSVC links aoti_cuda_backend into portable_lib without relying on C++
+  # symbols exported from aoti_cuda_shims.dll. In the shared layout the shims
+  # export everything and the delegate imports the allocator from there; a
+  # second copy would give it its own pools, which releasing cached memory
+  # through the delegate would never reach.
+  list(APPEND _aoti_cuda_backend_sources runtime/cuda_allocator.cpp)
 endif()
 add_library(
   aoti_cuda_backend ${_aoti_cuda_backend_library_type}
