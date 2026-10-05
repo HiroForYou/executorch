@@ -69,6 +69,40 @@ class CudaAllocator final : public executorch::runtime::DeviceAllocator {
       cudaStream_t stream);
 
   /**
+   * Whether a device supports the stream-ordered allocator (memory pools).
+   * Data-center GPUs in TCC mode on Windows do not; there cudaMallocAsync and
+   * CUDA graph memory are unavailable, and allocations fall back to cudaMalloc.
+   * Always true on ROCm.
+   *
+   * @param index Device to query, or a negative value for the current one.
+   */
+  static bool memory_pools_supported(
+      executorch::runtime::etensor::DeviceIndex index);
+
+  /**
+   * Stream-ordered scratch from the device default pool, which is what
+   * cudaMallocAsync on `stream` gives, for callers that do not want the
+   * backend's retaining pool. On a device without memory pools it falls back to
+   * cudaMalloc, and refuses while `stream` is capturing a CUDA graph, since a
+   * synchronous allocation cannot be recorded into one.
+   *
+   * @param index The device `stream` belongs to.
+   */
+  static executorch::runtime::Result<void*> allocate_stream_ordered(
+      size_t nbytes,
+      executorch::runtime::etensor::DeviceIndex index,
+      cudaStream_t stream);
+
+  /**
+   * Frees memory from allocate_stream_ordered on the same device and stream,
+   * returning the error a failed cudaFreeAsync reports.
+   */
+  static executorch::runtime::Error deallocate_stream_ordered(
+      void* ptr,
+      executorch::runtime::etensor::DeviceIndex index,
+      cudaStream_t stream);
+
+  /**
    * Return memory this backend's device pool is holding for reuse back to the
    * driver.
    *

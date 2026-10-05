@@ -539,15 +539,25 @@ class ET_EXPERIMENTAL CudaBackend final
         handle->get_cuda_stream(),
         method_name.c_str());
 
-    // Initialize CUDA graph state if enabled for this method.
+    // Initialize CUDA graph state if enabled for this method. Not on a device
+    // without memory pools: its allocations fall back to cudaMalloc, which a
+    // captured graph cannot own, so the method runs without a graph there.
     if (should_use_cuda_graph_for_method(method_name)) {
-      handle->cuda_graph_state.phase = CudaGraphPhase::Warmup;
-      handle->cuda_graph_state.warmup_remaining = kCudaGraphWarmupSteps;
-      ET_LOG(
-          Info,
-          "CUDA graph enabled for method '%s' (warmup=%d)",
-          method_name.c_str(),
-          kCudaGraphWarmupSteps);
+      if (!CudaAllocator::memory_pools_supported(-1)) {
+        ET_LOG(
+            Info,
+            "CUDA graph requested for method '%s' but this device has no "
+            "memory pools; running without a CUDA graph",
+            method_name.c_str());
+      } else {
+        handle->cuda_graph_state.phase = CudaGraphPhase::Warmup;
+        handle->cuda_graph_state.warmup_remaining = kCudaGraphWarmupSteps;
+        ET_LOG(
+            Info,
+            "CUDA graph enabled for method '%s' (warmup=%d)",
+            method_name.c_str(),
+            kCudaGraphWarmupSteps);
+      }
     }
 
     mutable_state_note_handle(handle);
