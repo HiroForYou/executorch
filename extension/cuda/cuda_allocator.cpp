@@ -13,6 +13,8 @@
 #include <executorch/runtime/platform/platform.h>
 
 #include <limits>
+#include <mutex>
+#include <unordered_map>
 
 #if !defined(EXECUTORCH_USE_HIP)
 #include <vector>
@@ -35,6 +37,17 @@ struct PalInitializer final {
 };
 
 const PalInitializer kPalInitializer{};
+
+// deallocate() must free the address cudaMalloc returned, not the rounded one.
+struct RoundedAllocations {
+  std::mutex mutex;
+  std::unordered_map<void*, void*> original_by_rounded;
+};
+
+RoundedAllocations& rounded_allocations() {
+  static RoundedAllocations state;
+  return state;
+}
 
 #if !defined(EXECUTORCH_USE_HIP)
 // The stream ordered allocator hands physical memory back to the driver
@@ -244,9 +257,9 @@ CudaAllocator::allocate(size_t nbytes, DeviceIndex index, size_t alignment) {
       "CudaAllocator::allocate: alignment must be a power of 2, got %zu",
       alignment);
 
-  // cudaMalloc guarantees only 256-byte alignment.
-  constexpr size_t kCudaMallocAlignment = 256;
-  const size_t padding = alignment > kCudaMallocAlignment ? alignment - 1 : 0;
+  // A block that misses the alignment is replaced by a padded one, so the
+  // padded size has to fit before any device call.
+  const size_t padding = alignment - 1;
   ET_CHECK_OR_RETURN_ERROR(
       nbytes <= std::numeric_limits<size_t>::max() - padding,
       InvalidArgument,
@@ -254,7 +267,6 @@ CudaAllocator::allocate(size_t nbytes, DeviceIndex index, size_t alignment) {
       nbytes,
       alignment);
 
-  void* ptr = nullptr;
   int prev_device = 0;
   bool switch_device = false;
 
@@ -293,7 +305,17 @@ CudaAllocator::allocate(size_t nbytes, DeviceIndex index, size_t alignment) {
     }
   }
 
-  cudaError_t err = cudaMalloc(&ptr, nbytes + padding);
+  void* block = nullptr;
+  size_t block_size = nbytes;
+  cudaError_t err = cudaMalloc(&block, block_size);
+  if (err == cudaSuccess && (reinterpret_cast<uintptr_t>(block) & padding)) {
+    // Padding every request would push blocks into the driver's next size step.
+    err = cudaFree(block);
+    if (err == cudaSuccess) {
+      block_size = nbytes + padding;
+      err = cudaMalloc(&block, block_size);
+    }
+  }
 
   if (switch_device) {
     (void)cudaSetDevice(prev_device);
@@ -302,35 +324,22 @@ CudaAllocator::allocate(size_t nbytes, DeviceIndex index, size_t alignment) {
   if (err != cudaSuccess) {
     ET_LOG(
         Error,
-        "cudaMalloc failed: %s (requested %zu bytes on device %d)",
-        cudaGetErrorString(err),
-        nbytes,
-        static_cast<int>(index));
+        "Allocating %zu bytes on device %d failed: %s",
+        block_size,
+        static_cast<int>(index),
+        cudaGetErrorString(err));
     return Error::MemoryAllocationFailed;
   }
 
-  if (padding != 0) {
-    void* aligned_ptr = reinterpret_cast<void*>(
-        (reinterpret_cast<uintptr_t>(ptr) + padding) & ~uintptr_t(padding));
-    if (aligned_ptr != ptr) {
-      const std::lock_guard<std::mutex> lock(padded_allocations_mutex_);
-      padded_allocations_.emplace(aligned_ptr, ptr);
-      padded_allocation_count_.fetch_add(1, std::memory_order_relaxed);
-    }
-    return aligned_ptr;
+  const size_t offset = -reinterpret_cast<uintptr_t>(block) & padding;
+  if (offset != 0) {
+    void* const ptr = static_cast<char*>(block) + offset;
+    auto& rounded = rounded_allocations();
+    const std::lock_guard<std::mutex> lock(rounded.mutex);
+    rounded.original_by_rounded.emplace(ptr, block);
+    return ptr;
   }
-
-  if ((reinterpret_cast<uintptr_t>(ptr) & (alignment - 1)) != 0) {
-    ET_LOG(
-        Error,
-        "cudaMalloc returned pointer %p not aligned to %zu bytes",
-        ptr,
-        alignment);
-    (void)cudaFree(ptr);
-    return Error::NotSupported;
-  }
-
-  return ptr;
+  return block;
 }
 
 void CudaAllocator::deallocate(void* ptr, DeviceIndex index) {
@@ -338,14 +347,13 @@ void CudaAllocator::deallocate(void* ptr, DeviceIndex index) {
     return;
   }
 
-  // Avoid locking when no rounded pointers are live.
-  if (padded_allocation_count_.load(std::memory_order_relaxed) != 0) {
-    const std::lock_guard<std::mutex> lock(padded_allocations_mutex_);
-    const auto it = padded_allocations_.find(ptr);
-    if (it != padded_allocations_.end()) {
+  {
+    auto& rounded = rounded_allocations();
+    const std::lock_guard<std::mutex> lock(rounded.mutex);
+    const auto it = rounded.original_by_rounded.find(ptr);
+    if (it != rounded.original_by_rounded.end()) {
       ptr = it->second;
-      padded_allocations_.erase(it);
-      padded_allocation_count_.fetch_sub(1, std::memory_order_relaxed);
+      rounded.original_by_rounded.erase(it);
     }
   }
 
