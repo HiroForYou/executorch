@@ -768,9 +768,9 @@ if(EXISTS "${_executorch_mlx_metallib}")
   set(MLX_METALLIB_PATH "${_executorch_mlx_metallib}")
 endif()
 _executorch_define_component(backend_openvino executorch_backend_openvino)
-# The CUDA delegate and its stream helper, present only in a wheel built from a
-# CUDA index. A CPU wheel defines neither, so a consumer asking for one is told
-# while configuring.
+# The CUDA delegate and shared allocator/stream/guard helpers are present only
+# in CUDA wheels. A CPU wheel reports either missing component at configure
+# time.
 _executorch_define_component(backend_cuda executorch_backend_cuda)
 _executorch_define_component(extension_cuda executorch_extension_cuda)
 if(TARGET executorch::extension_cuda)
@@ -780,7 +780,7 @@ if(TARGET executorch::extension_cuda)
     set_property(
       TARGET executorch::extension_cuda
       APPEND
-      PROPERTY INTERFACE_LINK_LIBRARIES CUDA::cudart
+      PROPERTY INTERFACE_INCLUDE_DIRECTORIES "${CUDAToolkit_INCLUDE_DIRS}"
     )
   endif()
 endif()
