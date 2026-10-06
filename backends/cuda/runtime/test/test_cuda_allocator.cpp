@@ -118,10 +118,12 @@ class CudaAllocatorTest : public testing::Test {
   int device_count_ = 0;
 };
 
-TEST(CudaAllocatorCompatibilityTest, BackendAliasSharesTheExtensionSingleton) {
-  EXPECT_EQ(
-      &CudaAllocator::instance(),
-      &executorch::extension::cuda::CudaAllocator::instance());
+TEST(CudaAllocatorCompatibilityTest, OnlyTheSingletonCanBeConstructed) {
+  EXPECT_FALSE(std::is_default_constructible_v<CudaAllocator>);
+  EXPECT_FALSE(std::is_copy_constructible_v<CudaAllocator>);
+  EXPECT_FALSE(std::is_move_constructible_v<CudaAllocator>);
+  EXPECT_FALSE(std::is_copy_assignable_v<CudaAllocator>);
+  EXPECT_FALSE(std::is_move_assignable_v<CudaAllocator>);
 }
 
 TEST_F(CudaAllocatorTest, CopyRoundtrip) {
